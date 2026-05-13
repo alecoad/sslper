@@ -50,6 +50,21 @@ CIPHER_LINE_RE = re.compile(
 )
 PROTO_LINE_RE = re.compile(r"^\s*(SSLv2|SSLv3)\s+(enabled|disabled)\s*$", re.I)
 
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
+
+def _render(s: str) -> str:
+    """Return `s` as-is in color mode, or with ANSI escapes stripped otherwise."""
+    return s if Color.enabled else _strip_ansi(s)
+
+
+def _vlen(s: str) -> int:
+    return len(_strip_ansi(s))
+
 
 class Color:
     RED = "\033[31m"
@@ -106,7 +121,7 @@ def parse_targets(args_targets, file_path):
 
 
 def run_sslscan(target: str, check: str, timeout: int) -> tuple[Optional[str], Optional[str]]:
-    argv = ["sslscan", "--no-colour", *COMMON_SKIPS]
+    argv = ["sslscan", *COMMON_SKIPS]
     if check == CHECK_SSLV2V3:
         argv.append("--no-ciphersuites")
     argv.append(target)
@@ -127,13 +142,23 @@ def run_sslscan(target: str, check: str, timeout: int) -> tuple[Optional[str], O
     return proc.stdout, None
 
 
-def check_sslv2v3(output: str) -> list:
-    evidence = []
+def check_sslv2v3(output: str) -> tuple[bool, list]:
+    """Always include SSLv2 and SSLv3 lines as evidence (disabled or not) so the
+    reader sees both. Host is vulnerable if either is enabled. Enabled lines are
+    sorted to the top so the summary table's first-line cell shows the trigger.
+    """
+    proto_lines = []
+    any_enabled = False
     for line in output.splitlines():
-        m = PROTO_LINE_RE.match(line)
-        if m and m.group(2).lower() == "enabled":
-            evidence.append(line.strip())
-    return evidence
+        m = PROTO_LINE_RE.match(_strip_ansi(line))
+        if not m:
+            continue
+        enabled = m.group(2).lower() == "enabled"
+        if enabled:
+            any_enabled = True
+        proto_lines.append((enabled, line.rstrip()))
+    proto_lines.sort(key=lambda p: not p[0])
+    return any_enabled, [l for _, l in proto_lines]
 
 
 def is_weak_cipher(name: str, bits: int) -> bool:
@@ -148,29 +173,30 @@ def is_weak_cipher(name: str, bits: int) -> bool:
     return False
 
 
-def check_weak_ciphers(output: str) -> list:
+def check_weak_ciphers(output: str) -> tuple[bool, list]:
     evidence = []
     in_section = False
     for line in output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Supported Server Cipher"):
+        plain = _strip_ansi(line)
+        stripped_plain = plain.strip()
+        if stripped_plain.startswith("Supported Server Cipher"):
             in_section = True
             continue
         if in_section:
-            if not stripped:
+            if not stripped_plain:
                 if evidence:
                     break
                 continue
-            if stripped.endswith(":") and "Cipher" not in stripped:
+            if stripped_plain.endswith(":") and "Cipher" not in stripped_plain:
                 break
-            m = CIPHER_LINE_RE.match(line)
+            m = CIPHER_LINE_RE.match(plain)
             if not m:
                 continue
             _, _, bits_s, name, _ = m.groups()
             bits = int(bits_s)
             if is_weak_cipher(name, bits):
-                evidence.append(stripped)
-    return evidence
+                evidence.append(line.rstrip())
+    return bool(evidence), evidence
 
 
 def scan_host(target: str, check: str, timeout: int) -> HostResult:
@@ -178,10 +204,10 @@ def scan_host(target: str, check: str, timeout: int) -> HostResult:
     if err:
         return HostResult(target=target, status="ERROR", error=err)
     if check == CHECK_SSLV2V3:
-        evidence = check_sslv2v3(output)
+        is_vuln, evidence = check_sslv2v3(output)
     else:
-        evidence = check_weak_ciphers(output)
-    status = "VULNERABLE" if evidence else "NOT VULNERABLE"
+        is_vuln, evidence = check_weak_ciphers(output)
+    status = "VULNERABLE" if is_vuln else "NOT VULNERABLE"
     return HostResult(target=target, status=status, evidence=evidence)
 
 
@@ -195,12 +221,6 @@ def progress_line(done: int, total: int, vuln: int, ok: int, err: int, width: in
         f"{Color.wrap(Color.YELLOW, str(err))} err"
     )
     return f"  scanning  [{bar}] {done}/{total}   {counts}"
-
-
-# Visible length of a string with ANSI escape codes stripped.
-_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
-def _vlen(s: str) -> int:
-    return len(_ANSI_RE.sub("", s))
 
 
 def status_label(status: str) -> str:
@@ -219,12 +239,12 @@ def print_host_detail(result: HostResult, check: str, max_evidence: int = 10):
     else:
         shown = result.evidence[:max_evidence]
         for line in shown:
-            print(f"    {line}")
+            print(f"    {_render(line)}")
         extra = len(result.evidence) - len(shown)
         if extra > 0:
             print(f"    ... ({extra} more)")
-        if not shown:
-            print("    (no weak protocols/ciphers found)" if result.status == "NOT VULNERABLE" else "")
+        if not shown and result.status == "NOT VULNERABLE":
+            print("    (no weak ciphers found)")
     print(f"    {status_label(result.status)} {title}")
     print()
 
@@ -258,7 +278,7 @@ def print_summary(results: list, check: str):
         else:
             col = Color.YELLOW
         status_cell = Color.wrap(col, f"{status:<{w_status}}")
-        print(f"{target:<{w_target}}  {status_cell}  {ev}")
+        print(f"{target:<{w_target}}  {status_cell}  {_render(ev)}")
 
 
 def main():
