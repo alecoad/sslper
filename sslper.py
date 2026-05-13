@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -18,6 +19,18 @@ CHECK_TITLES = {
     CHECK_SSLV2V3: "SSL Version 2 and 3 Protocol Detection",
     CHECK_WEAK: "SSL Weak Cipher Suites Supported",
 }
+
+# Skip the parts of sslscan we don't need for either check — heartbleed,
+# renegotiation, compression, cert fetch, fallback, group/sig listing.
+COMMON_SKIPS = [
+    "--no-renegotiation",
+    "--no-compression",
+    "--no-heartbleed",
+    "--no-check-certificate",
+    "--no-fallback",
+    "--no-groups",
+    "--no-sigs",
+]
 
 WEAK_NAME_PATTERNS = [
     re.compile(r"\bNULL\b", re.I),
@@ -92,10 +105,14 @@ def parse_targets(args_targets, file_path):
     return targets
 
 
-def run_sslscan(target: str, timeout: int) -> tuple[Optional[str], Optional[str]]:
+def run_sslscan(target: str, check: str, timeout: int) -> tuple[Optional[str], Optional[str]]:
+    argv = ["sslscan", "--no-colour", *COMMON_SKIPS]
+    if check == CHECK_SSLV2V3:
+        argv.append("--no-ciphersuites")
+    argv.append(target)
     try:
         proc = subprocess.run(
-            ["sslscan", "--no-colour", target],
+            argv,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -120,7 +137,10 @@ def check_sslv2v3(output: str) -> list:
 
 
 def is_weak_cipher(name: str, bits: int) -> bool:
-    if bits < 128:
+    # < 112 catches NULL (0), EXPORT (40/56), single-DES (56). 3DES is 112-bit
+    # effective and belongs to Nessus 42873 (Medium Strength), not 26928 — so
+    # don't trip on it via the bit-length rule.
+    if bits < 112:
         return True
     for pat in WEAK_NAME_PATTERNS:
         if pat.search(name):
@@ -154,7 +174,7 @@ def check_weak_ciphers(output: str) -> list:
 
 
 def scan_host(target: str, check: str, timeout: int) -> HostResult:
-    output, err = run_sslscan(target, timeout)
+    output, err = run_sslscan(target, check, timeout)
     if err:
         return HostResult(target=target, status="ERROR", error=err)
     if check == CHECK_SSLV2V3:
@@ -163,6 +183,24 @@ def scan_host(target: str, check: str, timeout: int) -> HostResult:
         evidence = check_weak_ciphers(output)
     status = "VULNERABLE" if evidence else "NOT VULNERABLE"
     return HostResult(target=target, status=status, evidence=evidence)
+
+
+def progress_line(done: int, total: int, vuln: int, ok: int, err: int, width: int = 28) -> str:
+    pct = done / total if total else 1.0
+    filled = int(round(pct * width))
+    bar = Color.wrap(Color.CYAN, "█" * filled) + ("░" * (width - filled))
+    counts = (
+        f"{Color.wrap(Color.RED, str(vuln))} vuln  "
+        f"{Color.wrap(Color.GREEN, str(ok))} ok  "
+        f"{Color.wrap(Color.YELLOW, str(err))} err"
+    )
+    return f"  scanning  [{bar}] {done}/{total}   {counts}"
+
+
+# Visible length of a string with ANSI escape codes stripped.
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+def _vlen(s: str) -> int:
+    return len(_ANSI_RE.sub("", s))
 
 
 def status_label(status: str) -> str:
@@ -256,13 +294,40 @@ def main():
         sys.exit(2)
 
     results: list = [None] * len(targets)
+    counts = {"vuln": 0, "ok": 0, "err": 0}
+    lock = threading.Lock()
+    is_tty = sys.stdout.isatty()
+    term_w = shutil.get_terminal_size((100, 24)).columns
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         future_to_idx = {
             ex.submit(scan_host, t, args.check, args.timeout): i
             for i, t in enumerate(targets)
         }
+        done = 0
         for fut in concurrent.futures.as_completed(future_to_idx):
-            results[future_to_idx[fut]] = fut.result()
+            r = fut.result()
+            with lock:
+                results[future_to_idx[fut]] = r
+                done += 1
+                if r.status == "VULNERABLE":
+                    counts["vuln"] += 1
+                elif r.status == "NOT VULNERABLE":
+                    counts["ok"] += 1
+                else:
+                    counts["err"] += 1
+                line = progress_line(done, len(targets),
+                                     counts["vuln"], counts["ok"], counts["err"])
+                if is_tty:
+                    pad = max(0, term_w - _vlen(line) - 1)
+                    sys.stdout.write("\r" + line + " " * pad)
+                    sys.stdout.flush()
+                else:
+                    print(line)
+
+    if is_tty:
+        sys.stdout.write("\r" + " " * (term_w - 1) + "\r")
+        sys.stdout.flush()
 
     for r in results:
         print_host_detail(r, args.check)
