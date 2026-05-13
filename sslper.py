@@ -354,7 +354,8 @@ def main():
 
     for r in results:
         print_host_detail(r, args.check)
-    print_summary(results, args.check)
+    if len(results) >= 10:
+        print_summary(results, args.check)
 
     any_vuln = any(r.status == "VULNERABLE" for r in results)
     sys.exit(1 if any_vuln else 0)
