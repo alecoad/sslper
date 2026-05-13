@@ -87,7 +87,8 @@ class Color:
 class HostResult:
     target: str
     status: str  # "VULNERABLE", "NOT VULNERABLE", "ERROR"
-    evidence: list = field(default_factory=list)
+    evidence: list = field(default_factory=list)  # full detail view (incl. context)
+    triggers: list = field(default_factory=list)  # subset that drove VULNERABLE; for summary cell
     error: Optional[str] = None
 
 
@@ -142,23 +143,25 @@ def run_sslscan(target: str, check: str, timeout: int) -> tuple[Optional[str], O
     return proc.stdout, None
 
 
-def check_sslv2v3(output: str) -> tuple[bool, list]:
-    """Always include SSLv2 and SSLv3 lines as evidence (disabled or not) so the
-    reader sees both. Host is vulnerable if either is enabled. Enabled lines are
-    sorted to the top so the summary table's first-line cell shows the trigger.
+def check_sslv2v3(output: str) -> tuple[bool, list, list]:
+    """Return (is_vuln, evidence, triggers). Evidence always includes both
+    SSLv2 and SSLv3 lines for context in the detail view; triggers is only
+    the lines that are 'enabled' (drives VULNERABLE + summary cell).
     """
     proto_lines = []
-    any_enabled = False
+    triggers = []
     for line in output.splitlines():
         m = PROTO_LINE_RE.match(_strip_ansi(line))
         if not m:
             continue
         enabled = m.group(2).lower() == "enabled"
+        raw = line.rstrip()
+        proto_lines.append((enabled, raw))
         if enabled:
-            any_enabled = True
-        proto_lines.append((enabled, line.rstrip()))
+            triggers.append(raw)
     proto_lines.sort(key=lambda p: not p[0])
-    return any_enabled, [l for _, l in proto_lines]
+    evidence = [l for _, l in proto_lines]
+    return bool(triggers), evidence, triggers
 
 
 def is_weak_cipher(name: str, bits: int) -> bool:
@@ -173,7 +176,7 @@ def is_weak_cipher(name: str, bits: int) -> bool:
     return False
 
 
-def check_weak_ciphers(output: str) -> tuple[bool, list]:
+def check_weak_ciphers(output: str) -> tuple[bool, list, list]:
     evidence = []
     in_section = False
     for line in output.splitlines():
@@ -196,7 +199,7 @@ def check_weak_ciphers(output: str) -> tuple[bool, list]:
             bits = int(bits_s)
             if is_weak_cipher(name, bits):
                 evidence.append(line.rstrip())
-    return bool(evidence), evidence
+    return bool(evidence), evidence, list(evidence)
 
 
 def scan_host(target: str, check: str, timeout: int) -> HostResult:
@@ -204,11 +207,11 @@ def scan_host(target: str, check: str, timeout: int) -> HostResult:
     if err:
         return HostResult(target=target, status="ERROR", error=err)
     if check == CHECK_SSLV2V3:
-        is_vuln, evidence = check_sslv2v3(output)
+        is_vuln, evidence, triggers = check_sslv2v3(output)
     else:
-        is_vuln, evidence = check_weak_ciphers(output)
+        is_vuln, evidence, triggers = check_weak_ciphers(output)
     status = "VULNERABLE" if is_vuln else "NOT VULNERABLE"
-    return HostResult(target=target, status=status, evidence=evidence)
+    return HostResult(target=target, status=status, evidence=evidence, triggers=triggers)
 
 
 def progress_line(done: int, total: int, vuln: int, ok: int, err: int, width: int = 28) -> str:
@@ -255,9 +258,9 @@ def print_summary(results: list, check: str):
     for r in results:
         if r.status == "ERROR":
             ev = r.error or "error"
-        elif r.evidence:
-            first = r.evidence[0]
-            extra = len(r.evidence) - 1
+        elif r.triggers:
+            first = r.triggers[0]
+            extra = len(r.triggers) - 1
             ev = first + (f"  (+{extra} more)" if extra else "")
         else:
             ev = "—"
